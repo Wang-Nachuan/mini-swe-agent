@@ -20,6 +20,7 @@ from minisweagent import Environment
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
 from minisweagent.models import get_model
+from minisweagent.run.benchmarks.utils import perf_metrics
 from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
 from minisweagent.run.benchmarks.utils.common import ProgressTrackingAgent
 from minisweagent.utils.log import add_file_handler, logger
@@ -127,6 +128,7 @@ def process_instance(
 ) -> None:
     """Process a single SWEBench instance."""
     instance_id = instance["instance_id"]
+    task_start_ts = time.time()
     instance_dir = output_dir / instance_id
     # avoid inconsistent state if something here fails and there's leftover previous files
     remove_from_preds_file(output_dir / "preds.json", instance_id)
@@ -175,6 +177,14 @@ def process_instance(
             logger.info(f"Saved trajectory to '{traj_path}'")
         update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
         progress_manager.on_instance_end(instance_id, exit_status)
+        api_calls = agent.n_calls if agent is not None else 0
+        perf_metrics.record_task_completion(
+            instance_id=instance_id,
+            start_ts=task_start_ts,
+            end_ts=time.time(),
+            exit_status=exit_status,
+            api_calls=api_calls,
+        )
 
 
 def filter_instances(

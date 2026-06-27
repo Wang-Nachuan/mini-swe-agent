@@ -4,6 +4,7 @@ import os
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import litellm
@@ -78,6 +79,9 @@ class LitellmModel:
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
+        if os.getenv("MSWEA_PERF_ENABLE_STREAMING") == "1":
+            return self._query_streaming(messages, **kwargs)
+
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
             with attempt:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
@@ -90,6 +94,144 @@ class LitellmModel:
             **cost_output,
             "timestamp": time.time(),
         }
+        return message
+
+    @staticmethod
+    def _as_dict(value: Any) -> dict:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if hasattr(value, "model_dump"):
+            return value.model_dump()
+        return {
+            key: getattr(value, key)
+            for key in dir(value)
+            if not key.startswith("_") and not callable(getattr(value, key))
+        }
+
+    @staticmethod
+    def _delta_has_output(delta: dict) -> bool:
+        if delta.get("content"):
+            return True
+        for tool_call in delta.get("tool_calls") or []:
+            tool_call = LitellmModel._as_dict(tool_call)
+            function = LitellmModel._as_dict(tool_call.get("function"))
+            if tool_call.get("id") or tool_call.get("type"):
+                return True
+            if function.get("name") or function.get("arguments"):
+                return True
+        return False
+
+    @staticmethod
+    def _tool_call_namespace(tool_call: dict) -> SimpleNamespace:
+        function = tool_call.get("function") or {}
+        return SimpleNamespace(
+            id=tool_call.get("id"),
+            function=SimpleNamespace(
+                name=function.get("name"),
+                arguments=function.get("arguments", ""),
+            ),
+        )
+
+    def _query_streaming(self, messages: list[dict[str, str]], **kwargs) -> dict:
+        prepared_messages = self._prepare_messages_for_api(messages)
+        request_start_ts = time.time()
+
+        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
+            with attempt:
+                content_parts: list[str] = []
+                tool_calls_by_index: dict[int, dict] = {}
+                first_token_ts = None
+                response_id = None
+                response_model = None
+                response_created = None
+                finish_reason = None
+                usage = None
+
+                stream = self._query(prepared_messages, stream=True, **kwargs)
+                for chunk in stream:
+                    chunk_ts = time.time()
+                    chunk_dict = self._as_dict(chunk)
+                    response_id = response_id or chunk_dict.get("id")
+                    response_model = response_model or chunk_dict.get("model")
+                    response_created = response_created or chunk_dict.get("created")
+                    usage = chunk_dict.get("usage") or usage
+
+                    choices = chunk_dict.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = self._as_dict(choices[0])
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    delta = self._as_dict(choice.get("delta"))
+
+                    if first_token_ts is None and self._delta_has_output(delta):
+                        first_token_ts = chunk_ts
+
+                    if delta.get("content"):
+                        content_parts.append(delta["content"])
+
+                    for tool_call in delta.get("tool_calls") or []:
+                        tool_call = self._as_dict(tool_call)
+                        index = int(tool_call.get("index") or 0)
+                        merged = tool_calls_by_index.setdefault(
+                            index,
+                            {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        if tool_call.get("id"):
+                            merged["id"] = tool_call["id"]
+                        if tool_call.get("type"):
+                            merged["type"] = tool_call["type"]
+
+                        function_delta = self._as_dict(tool_call.get("function"))
+                        if function_delta.get("name"):
+                            merged["function"]["name"] += function_delta["name"]
+                        if function_delta.get("arguments"):
+                            merged["function"]["arguments"] += function_delta[
+                                "arguments"
+                            ]
+
+        content = "".join(content_parts)
+        tool_calls = [
+            tool_calls_by_index[index] for index in sorted(tool_calls_by_index)
+        ]
+        action_tool_calls = [self._tool_call_namespace(tc) for tc in tool_calls]
+        message = {
+            "content": content,
+            "role": "assistant",
+            "tool_calls": tool_calls,
+            "function_call": None,
+        }
+        response_dump = {
+            "id": response_id,
+            "created": response_created,
+            "model": response_model,
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "finish_reason": finish_reason,
+                    "index": 0,
+                    "message": message.copy(),
+                }
+            ],
+            "usage": usage,
+        }
+        message["extra"] = {
+            "actions": parse_toolcall_actions(
+                action_tool_calls,
+                format_error_template=self.config.format_error_template,
+            ),
+            "response": response_dump,
+            "cost": 0.0,
+            "timestamp": time.time(),
+            "request_start_timestamp": request_start_ts,
+            "first_token_timestamp": first_token_ts,
+        }
+        GLOBAL_MODEL_STATS.add(0.0)
         return message
 
     def _calculate_cost(self, response) -> dict[str, float]:
