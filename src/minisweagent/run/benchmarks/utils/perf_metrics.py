@@ -54,23 +54,3 @@ def record_task_completion(
             api_calls,
         ],
     )
-
-
-def record_tool_iteration_ttft(
-    *,
-    instance_id: str,
-    step: int,
-    tool_end_ts: float,
-    first_token_ts: float,
-) -> None:
-    _append_csv(
-        "tool_iteration_ttft.csv",
-        ["instance_id", "step", "tool_end_ts", "first_token_ts", "ttft_s"],
-        [
-            instance_id,
-            step,
-            f"{tool_end_ts:.6f}",
-            f"{first_token_ts:.6f}",
-            f"{first_token_ts - tool_end_ts:.6f}",
-        ],
-    )

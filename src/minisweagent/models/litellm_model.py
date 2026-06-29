@@ -1,13 +1,15 @@
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Literal
 
+import httpx
 import litellm
+from litellm.llms.custom_httpx.http_handler import HTTPHandler
 from pydantic import BaseModel
 
 from minisweagent.models import GLOBAL_MODEL_STATS
@@ -22,6 +24,42 @@ from minisweagent.models.utils.openai_multimodal import expand_multimodal_conten
 from minisweagent.models.utils.retry import retry
 
 logger = logging.getLogger("litellm_model")
+_HTTP_CLIENT_LOCK = threading.Lock()
+_HTTP_CLIENT_CONFIG: tuple[int, int] | None = None
+_HTTP_COMPLETION_CLIENT: HTTPHandler | None = None
+
+
+def _configure_litellm_http_client() -> None:
+    max_connections = int(os.getenv("LITELLM_HTTP_MAX_CONNECTIONS", "0") or "0")
+    if max_connections <= 0:
+        return
+    max_keepalive = int(os.getenv("LITELLM_HTTP_MAX_KEEPALIVE_CONNECTIONS", str(max_connections)) or "0")
+    max_keepalive = max(max_keepalive, 0)
+    config = (max_connections, max_keepalive)
+
+    global _HTTP_CLIENT_CONFIG, _HTTP_COMPLETION_CLIENT
+    with _HTTP_CLIENT_LOCK:
+        if _HTTP_CLIENT_CONFIG == config and litellm.client_session is not None:
+            return
+        if litellm.client_session is not None and _HTTP_CLIENT_CONFIG is None:
+            logger.info("Leaving existing LiteLLM HTTP client session unchanged")
+            return
+        if litellm.client_session is not None:
+            litellm.client_session.close()
+        litellm.client_session = httpx.Client(
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive,
+            ),
+            follow_redirects=True,
+        )
+        _HTTP_COMPLETION_CLIENT = HTTPHandler(client=litellm.client_session)
+        _HTTP_CLIENT_CONFIG = config
+        logger.info(
+            "Configured LiteLLM HTTP client pool: max_connections=%s max_keepalive_connections=%s",
+            max_connections,
+            max_keepalive,
+        )
 
 
 class LitellmModelConfig(BaseModel):
@@ -57,17 +95,21 @@ class LitellmModel:
     ]
 
     def __init__(self, *, config_class: Callable = LitellmModelConfig, **kwargs):
+        _configure_litellm_http_client()
         self.config = config_class(**kwargs)
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
+            completion_kwargs = self.config.model_kwargs | kwargs
+            if self.config.model_name.startswith("hosted_vllm/") and "client" not in completion_kwargs:
+                completion_kwargs["client"] = _HTTP_COMPLETION_CLIENT
             return litellm.completion(
                 model=self.config.model_name,
                 messages=messages,
                 tools=[BASH_TOOL],
-                **(self.config.model_kwargs | kwargs),
+                **completion_kwargs,
             )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
@@ -79,9 +121,6 @@ class LitellmModel:
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
-        if os.getenv("MSWEA_PERF_ENABLE_STREAMING") == "1":
-            return self._query_streaming(messages, **kwargs)
-
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
             with attempt:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
@@ -94,144 +133,6 @@ class LitellmModel:
             **cost_output,
             "timestamp": time.time(),
         }
-        return message
-
-    @staticmethod
-    def _as_dict(value: Any) -> dict:
-        if value is None:
-            return {}
-        if isinstance(value, dict):
-            return value
-        if hasattr(value, "model_dump"):
-            return value.model_dump()
-        return {
-            key: getattr(value, key)
-            for key in dir(value)
-            if not key.startswith("_") and not callable(getattr(value, key))
-        }
-
-    @staticmethod
-    def _delta_has_output(delta: dict) -> bool:
-        if delta.get("content"):
-            return True
-        for tool_call in delta.get("tool_calls") or []:
-            tool_call = LitellmModel._as_dict(tool_call)
-            function = LitellmModel._as_dict(tool_call.get("function"))
-            if tool_call.get("id") or tool_call.get("type"):
-                return True
-            if function.get("name") or function.get("arguments"):
-                return True
-        return False
-
-    @staticmethod
-    def _tool_call_namespace(tool_call: dict) -> SimpleNamespace:
-        function = tool_call.get("function") or {}
-        return SimpleNamespace(
-            id=tool_call.get("id"),
-            function=SimpleNamespace(
-                name=function.get("name"),
-                arguments=function.get("arguments", ""),
-            ),
-        )
-
-    def _query_streaming(self, messages: list[dict[str, str]], **kwargs) -> dict:
-        prepared_messages = self._prepare_messages_for_api(messages)
-        request_start_ts = time.time()
-
-        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
-            with attempt:
-                content_parts: list[str] = []
-                tool_calls_by_index: dict[int, dict] = {}
-                first_token_ts = None
-                response_id = None
-                response_model = None
-                response_created = None
-                finish_reason = None
-                usage = None
-
-                stream = self._query(prepared_messages, stream=True, **kwargs)
-                for chunk in stream:
-                    chunk_ts = time.time()
-                    chunk_dict = self._as_dict(chunk)
-                    response_id = response_id or chunk_dict.get("id")
-                    response_model = response_model or chunk_dict.get("model")
-                    response_created = response_created or chunk_dict.get("created")
-                    usage = chunk_dict.get("usage") or usage
-
-                    choices = chunk_dict.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = self._as_dict(choices[0])
-                    finish_reason = choice.get("finish_reason") or finish_reason
-                    delta = self._as_dict(choice.get("delta"))
-
-                    if first_token_ts is None and self._delta_has_output(delta):
-                        first_token_ts = chunk_ts
-
-                    if delta.get("content"):
-                        content_parts.append(delta["content"])
-
-                    for tool_call in delta.get("tool_calls") or []:
-                        tool_call = self._as_dict(tool_call)
-                        index = int(tool_call.get("index") or 0)
-                        merged = tool_calls_by_index.setdefault(
-                            index,
-                            {
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            },
-                        )
-                        if tool_call.get("id"):
-                            merged["id"] = tool_call["id"]
-                        if tool_call.get("type"):
-                            merged["type"] = tool_call["type"]
-
-                        function_delta = self._as_dict(tool_call.get("function"))
-                        if function_delta.get("name"):
-                            merged["function"]["name"] += function_delta["name"]
-                        if function_delta.get("arguments"):
-                            merged["function"]["arguments"] += function_delta[
-                                "arguments"
-                            ]
-
-        content = "".join(content_parts)
-        tool_calls = [
-            tool_calls_by_index[index] for index in sorted(tool_calls_by_index)
-        ]
-        action_tool_calls = [self._tool_call_namespace(tc) for tc in tool_calls]
-        message = {
-            "content": content,
-            "role": "assistant",
-            "tool_calls": tool_calls,
-            "function_call": None,
-        }
-        response_dump = {
-            "id": response_id,
-            "created": response_created,
-            "model": response_model,
-            "object": "chat.completion",
-            "choices": [
-                {
-                    "finish_reason": finish_reason,
-                    "index": 0,
-                    "message": message.copy(),
-                }
-            ],
-            "usage": usage,
-        }
-        message["extra"] = {
-            "actions": parse_toolcall_actions(
-                action_tool_calls,
-                format_error_template=self.config.format_error_template,
-            ),
-            "response": response_dump,
-            "cost": 0.0,
-            "timestamp": time.time(),
-            "request_start_timestamp": request_start_ts,
-            "first_token_timestamp": first_token_ts,
-        }
-        GLOBAL_MODEL_STATS.add(0.0)
         return message
 
     def _calculate_cost(self, response) -> dict[str, float]:
