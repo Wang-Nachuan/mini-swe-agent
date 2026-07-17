@@ -108,7 +108,7 @@ class DefaultAgent:
         """Query the LM, execute actions."""
         return self.execute_actions(self.query())
 
-    def query(self) -> dict:
+    def query(self, **model_kwargs) -> dict:
         """Query the model and return model messages. Override to add hooks."""
         if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
             raise LimitsExceeded(
@@ -127,7 +127,7 @@ class DefaultAgent:
                 }
             )
         self.n_calls += 1
-        message = self.model.query(self.messages)
+        message = self.model.query(self.messages, **model_kwargs)
         self.cost += message.get("extra", {}).get("cost", 0.0)
         self.add_messages(message)
         return message

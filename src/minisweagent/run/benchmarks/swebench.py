@@ -129,6 +129,7 @@ def process_instance(
     """Process a single SWEBench instance."""
     instance_id = instance["instance_id"]
     task_start_ts = time.time()
+    task_start_time = time.perf_counter()
     instance_dir = output_dir / instance_id
     # avoid inconsistent state if something here fails and there's leftover previous files
     remove_from_preds_file(output_dir / "preds.json", instance_id)
@@ -178,12 +179,20 @@ def process_instance(
         update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
         progress_manager.on_instance_end(instance_id, exit_status)
         api_calls = agent.n_calls if agent is not None else 0
+        task_end_ts = time.time()
+        task_duration_s = time.perf_counter() - task_start_time
+        if agent is not None:
+            perf_metrics.record_model_calls(agent.model_call_records)
         perf_metrics.record_task_completion(
             instance_id=instance_id,
             start_ts=task_start_ts,
-            end_ts=time.time(),
+            end_ts=task_end_ts,
+            duration_s=task_duration_s,
             exit_status=exit_status,
             api_calls=api_calls,
+            model_query_s=agent.model_query_s if agent is not None else 0.0,
+            tool_execution_s=agent.tool_execution_s if agent is not None else 0.0,
+            tool_calls=agent.tool_calls if agent is not None else 0,
         )
 
 
