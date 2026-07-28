@@ -38,12 +38,14 @@ class RunBatchProgressManager:
         self,
         num_instances: int,
         yaml_report_path: Path | None = None,
+        write_report_on_update: bool = True,
     ):
         """This class manages a progress bar/UI for run-batch
 
         Args:
             num_instances: Number of task instances
             yaml_report_path: Path to save a yaml report of the instances and their exit statuses
+            write_report_on_update: Rewrite the YAML report after each completed instance
         """
 
         self._spinner_tasks: dict[str, TaskID] = {}
@@ -81,6 +83,7 @@ class RunBatchProgressManager:
 
         self.render_group = Group(self._main_progress_bar, Table(), self._task_progress_bar)
         self._yaml_report_path = yaml_report_path
+        self._write_report_on_update = write_report_on_update
 
     @property
     def n_completed(self) -> int:
@@ -152,8 +155,8 @@ class RunBatchProgressManager:
             self._main_progress_bar.update(TaskID(0), advance=1, eta=self._get_eta_text())
         self.update_exit_status_table()
         self._update_total_costs()
-        if self._yaml_report_path is not None:
-            self._save_overview_data_yaml(self._yaml_report_path)
+        if self._write_report_on_update:
+            self.save_report()
 
     def on_uncaught_exception(self, instance_id: str, exception: Exception) -> None:
         self.on_instance_end(instance_id, f"Uncaught {type(exception).__name__}")
@@ -164,6 +167,11 @@ class RunBatchProgressManager:
             print(f"{status}: {len(instances)}")
             for instance in instances:
                 print(f"  {instance}")
+
+    def save_report(self) -> None:
+        """Write the current exit-status report, if configured."""
+        if self._yaml_report_path is not None:
+            self._save_overview_data_yaml(self._yaml_report_path)
 
     def _get_overview_data(self) -> dict:
         """Get data like exit statuses, total costs, etc."""

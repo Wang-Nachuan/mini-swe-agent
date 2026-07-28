@@ -27,9 +27,18 @@ BASH_TOOL = {
 }
 
 
-def parse_toolcall_actions(tool_calls: list, *, format_error_template: str) -> list[dict]:
+def parse_toolcall_actions(
+    tool_calls: list,
+    *,
+    format_error_template: str,
+    tool_name: str = "bash",
+    argument_name: str = "command",
+    allow_empty: bool = False,
+) -> list[dict]:
     """Parse tool calls from the response. Raises FormatError if unknown tool or invalid args."""
     if not tool_calls:
+        if allow_empty:
+            return []
         raise FormatError(
             {
                 "role": "user",
@@ -48,10 +57,10 @@ def parse_toolcall_actions(tool_calls: list, *, format_error_template: str) -> l
             args = json.loads(tool_call.function.arguments)
         except Exception as e:
             error_msg = f"Error parsing tool call arguments: {e}."
-        if tool_call.function.name != "bash":
+        if tool_call.function.name != tool_name:
             error_msg += f"Unknown tool '{tool_call.function.name}'."
-        if not isinstance(args, dict) or "command" not in args:
-            error_msg += "Missing 'command' argument in bash tool call."
+        if not isinstance(args, dict) or argument_name not in args:
+            error_msg += f"Missing '{argument_name}' argument in {tool_name} tool call."
         if error_msg:
             raise FormatError(
                 {
@@ -62,7 +71,68 @@ def parse_toolcall_actions(tool_calls: list, *, format_error_template: str) -> l
                     "extra": {"interrupt_type": "FormatError"},
                 }
             )
-        actions.append({"command": args["command"], "tool_call_id": tool_call.id})
+        actions.append({"command": args[argument_name], "tool_call_id": tool_call.id})
+    return actions
+
+
+def parse_dynamic_toolcall_actions(
+    tool_calls: list,
+    *,
+    tools: list[dict],
+    format_error_template: str,
+    allow_empty: bool = False,
+) -> list[dict]:
+    """Parse calls for query-scoped OpenAI tools while retaining typed arguments."""
+    if not tool_calls:
+        if allow_empty:
+            return []
+        raise FormatError(
+            {
+                "role": "user",
+                "content": Template(format_error_template, undefined=StrictUndefined).render(
+                    error="No tool calls found in the response. Every response MUST include at least one tool call.",
+                    actions=[],
+                ),
+                "extra": {"interrupt_type": "FormatError"},
+            }
+        )
+
+    tool_names = {
+        tool["function"]["name"]
+        for tool in tools
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict)
+    }
+    actions = []
+    for tool_call in tool_calls:
+        error_msg = ""
+        arguments = {}
+        arguments_json = tool_call.function.arguments
+        try:
+            arguments = json.loads(arguments_json)
+        except Exception as error:
+            error_msg = f"Error parsing tool call arguments: {error}."
+        if tool_call.function.name not in tool_names:
+            error_msg += f"Unknown tool '{tool_call.function.name}'."
+        if not isinstance(arguments, dict):
+            error_msg += "Tool call arguments must be a JSON object."
+        if error_msg:
+            raise FormatError(
+                {
+                    "role": "user",
+                    "content": Template(format_error_template, undefined=StrictUndefined).render(
+                        actions=[], error=error_msg.strip()
+                    ),
+                    "extra": {"interrupt_type": "FormatError"},
+                }
+            )
+        actions.append(
+            {
+                "name": tool_call.function.name,
+                "arguments": arguments,
+                "arguments_json": arguments_json,
+                "tool_call_id": tool_call.id,
+            }
+        )
     return actions
 
 

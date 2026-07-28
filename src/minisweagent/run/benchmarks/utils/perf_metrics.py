@@ -52,6 +52,10 @@ def record_model_calls(records: list[dict[str, Any]]) -> None:
             "end_ts",
             "client_duration_s",
             "status",
+            "turn_index",
+            "step_index",
+            "prompt_tokens",
+            "completion_tokens",
         ],
         [
             [
@@ -63,6 +67,10 @@ def record_model_calls(records: list[dict[str, Any]]) -> None:
                 f"{record['end_ts']:.6f}",
                 f"{record['client_duration_s']:.6f}",
                 record["status"],
+                record.get("turn_index", ""),
+                record.get("step_index", ""),
+                record.get("prompt_tokens", ""),
+                record.get("completion_tokens", ""),
             ]
             for record in records
         ],

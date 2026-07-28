@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -147,6 +148,28 @@ def test_successful_completion(model_factory):
     assert info["exit_status"] == "Submitted"
     assert info["submission"] == "Task completed successfully\n"
     assert agent.n_calls == 2
+
+
+def test_step_checkpoint_can_be_disabled(model_factory):
+    factory, config = model_factory
+    agent = DefaultAgent(
+        model=factory(
+            [
+                (
+                    "Finish",
+                    [{"command": "echo 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'\necho 'done'"}],
+                )
+            ]
+        ),
+        env=LocalEnvironment(),
+        **{**config, "save_on_step": False},
+    )
+
+    with patch.object(agent, "save") as save:
+        info = agent.run("Finish")
+
+    assert info["exit_status"] == "Submitted"
+    save.assert_not_called()
 
 
 def test_step_limit_enforcement(model_factory):

@@ -6,6 +6,7 @@ from minisweagent.exceptions import FormatError
 from minisweagent.models.utils.actions_toolcall import (
     BASH_TOOL,
     format_toolcall_observation_messages,
+    parse_dynamic_toolcall_actions,
     parse_toolcall_actions,
 )
 
@@ -69,6 +70,55 @@ class TestParseToolcallActions:
         with pytest.raises(FormatError) as exc_info:
             parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
         assert "Missing 'command' argument" in exc_info.value.messages[0]["content"]
+
+    def test_configurable_tool_and_argument(self):
+        tool_call = MagicMock()
+        tool_call.function.name = "sql"
+        tool_call.function.arguments = '{"query": "SHOW TABLES"}'
+        tool_call.id = "call_sql"
+        assert parse_toolcall_actions(
+            [tool_call],
+            format_error_template="{{ error }}",
+            tool_name="sql",
+            argument_name="query",
+        ) == [{"command": "SHOW TABLES", "tool_call_id": "call_sql"}]
+
+    def test_dynamic_typed_tools_and_empty_response(self):
+        tool_call = MagicMock()
+        tool_call.function.name = "search"
+        tool_call.function.arguments = '{"limit": 3, "tags": ["io", "kv"]}'
+        tool_call.id = "call_search"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        assert parse_dynamic_toolcall_actions(
+            [tool_call],
+            tools=tools,
+            format_error_template="{{ error }}",
+        ) == [
+            {
+                "name": "search",
+                "arguments": {"limit": 3, "tags": ["io", "kv"]},
+                "arguments_json": '{"limit": 3, "tags": ["io", "kv"]}',
+                "tool_call_id": "call_search",
+            }
+        ]
+        assert (
+            parse_dynamic_toolcall_actions(
+                [],
+                tools=tools,
+                format_error_template="{{ error }}",
+                allow_empty=True,
+            )
+            == []
+        )
 
 
 class TestFormatToolcallObservationMessages:

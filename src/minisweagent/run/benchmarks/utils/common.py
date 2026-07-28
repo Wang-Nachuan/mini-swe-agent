@@ -24,18 +24,25 @@ class ProgressTrackingAgent(DefaultAgent):
         self.tool_calls = 0
         self.model_call_records: list[dict] = []
 
-    def query(self) -> dict:
+    def query(self, **model_kwargs) -> dict:
         call_index = self.n_calls + 1
         client_request_id = f"mswea-{self.instance_id}-{call_index}"
         model_name = getattr(self.model.config, "model_name", "")
-        query_kwargs = {}
+        query_kwargs = dict(model_kwargs)
         if model_name.startswith("hosted_vllm/"):
-            model_kwargs = getattr(self.model.config, "model_kwargs", {})
+            config_model_kwargs = getattr(self.model.config, "model_kwargs", {})
             headers = {
                 key: value
-                for key, value in model_kwargs.get("extra_headers", {}).items()
+                for key, value in config_model_kwargs.get("extra_headers", {}).items()
                 if key.lower() != "x-request-id"
             }
+            headers.update(
+                {
+                    key: value
+                    for key, value in query_kwargs.get("extra_headers", {}).items()
+                    if key.lower() != "x-request-id"
+                }
+            )
             headers["X-Request-Id"] = client_request_id
             query_kwargs["extra_headers"] = headers
 
@@ -53,6 +60,7 @@ class ProgressTrackingAgent(DefaultAgent):
                 end_ts = time.time()
                 duration_s = time.perf_counter() - start_time
                 response = (message or {}).get("extra", {}).get("response", {})
+                usage = (response.get("usage") or {}) if isinstance(response, dict) else {}
                 request_id = response.get("id") if isinstance(response, dict) else None
                 if not request_id:
                     request_id = (
@@ -69,6 +77,8 @@ class ProgressTrackingAgent(DefaultAgent):
                         "end_ts": end_ts,
                         "client_duration_s": duration_s,
                         "status": status,
+                        "prompt_tokens": usage.get("prompt_tokens", ""),
+                        "completion_tokens": usage.get("completion_tokens", ""),
                     }
                 )
         return message

@@ -10,12 +10,12 @@ from typing import Any, Literal
 import httpx
 import litellm
 from litellm.llms.custom_httpx.http_handler import HTTPHandler
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.utils.actions_toolcall import (
-    BASH_TOOL,
     format_toolcall_observation_messages,
+    parse_dynamic_toolcall_actions,
     parse_toolcall_actions,
 )
 from minisweagent.models.utils.anthropic_utils import _reorder_anthropic_thinking_blocks
@@ -27,6 +27,32 @@ logger = logging.getLogger("litellm_model")
 _HTTP_CLIENT_LOCK = threading.Lock()
 _HTTP_CLIENT_CONFIG: tuple[int, int] | None = None
 _HTTP_COMPLETION_CLIENT: HTTPHandler | None = None
+
+
+class ActionToolConfig(BaseModel):
+    name: str = "bash"
+    description: str = "Execute a bash command"
+    argument_name: str = "command"
+    argument_description: str = "The bash command to execute"
+
+    def model_tool(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        self.argument_name: {
+                            "type": "string",
+                            "description": self.argument_description,
+                        }
+                    },
+                    "required": [self.argument_name],
+                },
+            },
+        }
 
 
 def _configure_litellm_http_client() -> None:
@@ -82,6 +108,8 @@ class LitellmModelConfig(BaseModel):
     """Template used to render the observation after executing an action."""
     multimodal_regex: str = ""
     """Regex to extract multimodal content. Empty string disables multimodal processing."""
+    action_tool: ActionToolConfig = Field(default_factory=ActionToolConfig)
+    """Single action tool exposed to the model. Parsed actions retain the canonical `command` key."""
 
 
 class LitellmModel:
@@ -100,7 +128,7 @@ class LitellmModel:
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
-    def _query(self, messages: list[dict[str, str]], **kwargs):
+    def _query(self, messages: list[dict[str, str]], *, tools: list[dict] | None = None, **kwargs):
         try:
             completion_kwargs = self.config.model_kwargs | kwargs
             if self.config.model_name.startswith("hosted_vllm/") and "client" not in completion_kwargs:
@@ -108,7 +136,7 @@ class LitellmModel:
             return litellm.completion(
                 model=self.config.model_name,
                 messages=messages,
-                tools=[BASH_TOOL],
+                tools=tools if tools is not None else [self.config.action_tool.model_tool()],
                 **completion_kwargs,
             )
         except litellm.exceptions.AuthenticationError as e:
@@ -120,15 +148,22 @@ class LitellmModel:
         prepared = _reorder_anthropic_thinking_blocks(prepared)
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
-    def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
+    def query(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tools: list[dict] | None = None,
+        allow_empty_actions: bool = False,
+        **kwargs,
+    ) -> dict:
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
             with attempt:
-                response = self._query(self._prepare_messages_for_api(messages), **kwargs)
+                response = self._query(self._prepare_messages_for_api(messages), tools=tools, **kwargs)
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = response.choices[0].message.model_dump()
         message["extra"] = {
-            "actions": self._parse_actions(response),
+            "actions": self._parse_actions(response, tools=tools, allow_empty=allow_empty_actions),
             "response": response.model_dump(),
             **cost_output,
             "timestamp": time.time(),
@@ -155,10 +190,29 @@ class LitellmModel:
                 raise RuntimeError(msg) from e
         return {"cost": cost}
 
-    def _parse_actions(self, response) -> list[dict]:
+    def _parse_actions(
+        self,
+        response,
+        *,
+        tools: list[dict] | None = None,
+        allow_empty: bool = False,
+    ) -> list[dict]:
         """Parse tool calls from the response. Raises FormatError if unknown tool."""
         tool_calls = response.choices[0].message.tool_calls or []
-        return parse_toolcall_actions(tool_calls, format_error_template=self.config.format_error_template)
+        if tools is not None:
+            return parse_dynamic_toolcall_actions(
+                tool_calls,
+                tools=tools,
+                format_error_template=self.config.format_error_template,
+                allow_empty=allow_empty,
+            )
+        return parse_toolcall_actions(
+            tool_calls,
+            format_error_template=self.config.format_error_template,
+            tool_name=self.config.action_tool.name,
+            argument_name=self.config.action_tool.argument_name,
+            allow_empty=allow_empty,
+        )
 
     def format_message(self, **kwargs) -> dict:
         return expand_multimodal_content(kwargs, pattern=self.config.multimodal_regex)

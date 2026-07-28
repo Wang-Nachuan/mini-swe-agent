@@ -98,6 +98,23 @@ def test_yaml_report_generation(manager_with_yaml):
     assert data["instances_by_exit_status"]["failed"] == ["task_2"]
 
 
+def test_yaml_report_can_be_deferred(tmp_path):
+    yaml_path = tmp_path / "report.yaml"
+    manager = RunBatchProgressManager(
+        num_instances=1,
+        yaml_report_path=yaml_path,
+        write_report_on_update=False,
+    )
+
+    manager.on_instance_start("task_1")
+    manager.on_instance_end("task_1", "success")
+    assert not yaml_path.exists()
+
+    manager.save_report()
+    data = yaml.safe_load(yaml_path.read_text())
+    assert data["instances_by_exit_status"]["success"] == ["task_1"]
+
+
 def test_get_overview_data(manager):
     manager.on_instance_start("task_1")
     manager.on_instance_end("task_1", "success")

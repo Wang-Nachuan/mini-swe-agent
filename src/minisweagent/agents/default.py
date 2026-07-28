@@ -31,6 +31,8 @@ class AgentConfig(BaseModel):
     """Stop agent after this many seconds of wall-clock time. 0 means no limit."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
+    save_on_step: bool = True
+    """Checkpoint the trajectory after every agent step."""
 
 
 class DefaultAgent:
@@ -99,7 +101,8 @@ class DefaultAgent:
                 self.handle_uncaught_exception(e)
                 raise
             finally:
-                self.save(self.config.output_path)
+                if self.config.save_on_step:
+                    self.save(self.config.output_path)
             if self.messages[-1].get("role") == "exit":
                 break
         return self.messages[-1].get("extra", {})

@@ -11,6 +11,9 @@ class TestLitellmModelConfig:
     def test_default_format_error_template(self):
         assert LitellmModelConfig(model_name="test").format_error_template == "{{ error }}"
 
+    def test_default_action_tool_is_bash(self):
+        assert LitellmModelConfig(model_name="test").action_tool.model_tool() == BASH_TOOL
+
 
 def _mock_litellm_response(tool_calls):
     mock_response = MagicMock()
@@ -54,6 +57,30 @@ class TestLitellmModel:
 
     @patch("minisweagent.models.litellm_model.litellm.completion")
     @patch("minisweagent.models.litellm_model.litellm.cost_calculator.completion_cost")
+    def test_configurable_action_tool(self, mock_cost, mock_completion):
+        tool_call = MagicMock()
+        tool_call.function.name = "sql"
+        tool_call.function.arguments = '{"query": "SHOW TABLES"}'
+        tool_call.id = "call_sql"
+        mock_completion.return_value = _mock_litellm_response([tool_call])
+        mock_cost.return_value = 0.001
+
+        model = LitellmModel(
+            model_name="gpt-4",
+            action_tool={
+                "name": "sql",
+                "description": "Execute SQL",
+                "argument_name": "query",
+                "argument_description": "A SQL query",
+            },
+        )
+        result = model.query([{"role": "user", "content": "list tables"}])
+
+        assert mock_completion.call_args.kwargs["tools"][0]["function"]["name"] == "sql"
+        assert result["extra"]["actions"] == [{"command": "SHOW TABLES", "tool_call_id": "call_sql"}]
+
+    @patch("minisweagent.models.litellm_model.litellm.completion")
+    @patch("minisweagent.models.litellm_model.litellm.cost_calculator.completion_cost")
     def test_parse_actions_no_tool_calls_raises(self, mock_cost, mock_completion):
         mock_completion.return_value = _mock_litellm_response(None)
         mock_cost.return_value = 0.001
@@ -61,6 +88,31 @@ class TestLitellmModel:
         model = LitellmModel(model_name="gpt-4")
         with pytest.raises(FormatError):
             model.query([{"role": "user", "content": "test"}])
+
+    @patch("minisweagent.models.litellm_model.litellm.completion")
+    @patch("minisweagent.models.litellm_model.litellm.cost_calculator.completion_cost")
+    def test_query_scoped_dynamic_tools_allow_empty_actions(self, mock_cost, mock_completion):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        mock_completion.return_value = _mock_litellm_response(None)
+        mock_cost.return_value = 0.001
+
+        model = LitellmModel(model_name="gpt-4")
+        result = model.query(
+            [{"role": "user", "content": "done"}],
+            tools=tools,
+            allow_empty_actions=True,
+        )
+
+        assert mock_completion.call_args.kwargs["tools"] == tools
+        assert result["extra"]["actions"] == []
 
     def test_format_observation_messages(self):
         model = LitellmModel(model_name="gpt-4", observation_template="{{ output.output }}")

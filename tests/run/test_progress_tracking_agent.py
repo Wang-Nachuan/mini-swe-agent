@@ -91,6 +91,16 @@ def test_records_model_and_each_tool_call_wall_time():
     assert agent.model_call_records[0]["status"] == "ok"
 
 
+def test_query_forwards_workload_specific_model_kwargs():
+    agent = _agent()
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+
+    agent.query(tools=tools, allow_empty_actions=True)
+
+    assert agent.model.query_kwargs["tools"] == tools
+    assert agent.model.query_kwargs["allow_empty_actions"] is True
+
+
 def test_tool_time_is_recorded_when_execute_raises():
     class _SubmittingEnvironment(_Environment):
         def execute(self, action: dict) -> dict:

@@ -16,6 +16,8 @@ subcommands = [
     ("minisweagent.run.benchmarks.swebench", ["swebench"], "Evaluate on SWE-bench (batch mode)"),
     ("minisweagent.run.benchmarks.swebench_single", ["swebench-single"], "Evaluate on SWE-bench (single instance)"),
     ("minisweagent.run.benchmarks.programbench", ["programbench"], "Run on ProgramBench (batch mode)"),
+    ("workloads.intercode_sql.runner", ["intercode-sql"], "Run on InterCode SQL (batch mode)"),
+    ("workloads.bfcl.runner", ["bfcl"], "Run on BFCL multi-turn workloads (batch mode)"),
 ]
 
 
